@@ -3,5 +3,4 @@ numpy
 matplotlib
 pillow
 open3d
-pyquaternion
 

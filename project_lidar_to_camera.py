@@ -1,17 +1,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.data_classes import LidarPointCloud
 from nuscenes.utils.geometry_utils import view_points
-import os
-from pyquaternion import Quaternion
+
+from load_data import load_lidar_camera_sample
 
 def get_calibration_matrices(nusc, lidar_token, camera_token):
     """
     Get calibration matrices to transform from LiDAR to camera coordinate frame
     
-    Args:
+    inputs:
         nusc: NuScenes instance
         lidar_token: LiDAR sample_data token
         camera_token: Camera sample_data token
@@ -20,16 +18,16 @@ def get_calibration_matrices(nusc, lidar_token, camera_token):
         cam_intrinsic: Camera intrinsic matrix (3x3)
         lidar_to_cam_transform: Transformation matrix from LiDAR to camera (4x4)
     """
-    # Get sensor calibration data
+    # geting lidar and camera sample data
     lidar_sample = nusc.get('sample_data', lidar_token)
     camera_sample = nusc.get('sample_data', camera_token)
     
-    # Get calibrated sensor records (contain extrinsics and intrinsics)
+    # getting calibrated sensor records (contain extrinsics and intrinsics)
     lidar_calib = nusc.get('calibrated_sensor', lidar_sample['calibrated_sensor_token'])
     camera_calib = nusc.get('calibrated_sensor', camera_sample['calibrated_sensor_token'])
     
-    # Camera intrinsic matrix (3x3)
-    # Maps 3D points in camera frame to 2D pixel coordinates
+    # camera intrinsic matrix (3x3)
+    # maps 3D points in camera frame to 2D pixel coordinates
     cam_intrinsic = np.array(camera_calib['camera_intrinsic'])
     
     print("\nCamera Intrinsic Matrix:")
@@ -40,20 +38,21 @@ def get_calibration_matrices(nusc, lidar_token, camera_token):
     print(f"  cx = {cam_intrinsic[0,2]:.2f} (principal point X)")
     print(f"  cy = {cam_intrinsic[1,2]:.2f} (principal point Y)")
     
-    # Get ego pose (vehicle position in world frame) for both sensors
+    # getting ego pose (vehicle position in world frame) for both sensors
     lidar_ego_pose = nusc.get('ego_pose', lidar_sample['ego_pose_token'])
     camera_ego_pose = nusc.get('ego_pose', camera_sample['ego_pose_token'])
+    
     
     # Build transformation matrices
 
     # Step 1: LiDAR sensor frame → vehicle frame
     lidar_translation = np.array(lidar_calib['translation'])
-    lidar_rotation = np.array(lidar_calib['rotation'])  # quaternion
+    lidar_rotation = np.array(lidar_calib['rotation'])  # quaternion [w, x, y, z] (NuScenes format)
     lidar_to_ego = transform_matrix(lidar_translation, lidar_rotation)
     
     # Step 2: Vehicle frame → camera frame (inverse of camera → vehicle)
     cam_translation = np.array(camera_calib['translation'])
-    cam_rotation = np.array(camera_calib['rotation'])  # quaternion
+    cam_rotation = np.array(camera_calib['rotation']) # quaternion [w, x, y, z] (NuScenes format)
     ego_to_cam = np.linalg.inv(transform_matrix(cam_translation, cam_rotation))
     
     # Combined: LiDAR frame → camera frame
@@ -66,6 +65,28 @@ def get_calibration_matrices(nusc, lidar_token, camera_token):
     return cam_intrinsic, lidar_to_cam_transform
 
 
+def quaternion_to_rotation_matrix(q):
+    """
+    Convert quaternion to 3x3 rotation matrix using numpy
+    
+    inputs:
+        q: quaternion [w, x, y, z] (NuScenes format)
+    
+    Returns:
+        3x3 rotation matrix
+    """
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    
+    # Rotation matrix from quaternion formula
+    # https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation
+    R = np.array([
+        [1 - 2*(y**2 + z**2),     2*(x*y - w*z),     2*(x*z + w*y)],
+        [    2*(x*y + w*z), 1 - 2*(x**2 + z**2),     2*(y*z - w*x)],
+        [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
+    ])
+    
+    return R
+
 def transform_matrix(translation, rotation_quat):
     """
     Build a 4x4 homogeneous transformation matrix from translation and quaternion
@@ -77,8 +98,11 @@ def transform_matrix(translation, rotation_quat):
     Returns:
         4x4 transformation matrix
     """
+    # start with 4x4 identity matrix
     mat = np.eye(4)
-    mat[:3, :3] = Quaternion(rotation_quat).rotation_matrix
+    # rotation part (top-left 3x3)
+    mat[:3, :3] = quaternion_to_rotation_matrix(rotation_quat)
+    # translation part (top-right 3x1)
     mat[:3, 3] = translation
     return mat
 
@@ -98,23 +122,22 @@ def project_lidar_to_camera(lidar_points, cam_intrinsic, lidar_to_cam_transform,
         depths: Depth values for each projected point (M array)
         mask: Boolean mask indicating which points are in camera view (N array)
     """
-    # Transform LiDAR points to camera frame
-    # Add homogeneous coordinate (row of ones)
+    # transform LiDAR points to camera frame
     points_3d_lidar = np.vstack((lidar_points[:3, :], np.ones(lidar_points.shape[1])))
     
-    # Apply transformation: LiDAR frame → camera frame
+    # applying transformation: LiDAR frame → camera frame
     points_3d_cam = lidar_to_cam_transform @ points_3d_lidar
     
-    # Filter points behind the camera (negative depth)
-    # In camera frame: X=right, Y=down, Z=forward (depth)
+    # filter points behind the camera (negative depth)
+    # in camera frame: X=right, Y=down, Z=forward (depth)
     depths = points_3d_cam[2, :]
     mask = depths > 0  # Keep only points in front of camera
     
-    # Project 3D points to 2D image plane using camera intrinsics
-    # Uses the view_points utility from NuScenes
+    # project 3D points to 2D image plane using camera intrinsics
+    # refer notes for more details
     points_2d = view_points(points_3d_cam[:3, :], cam_intrinsic, normalize=True)[:2, :]
     
-    # Filter points outside image boundaries
+    # filter points outside image boundaries
     image_h, image_w = image_shape[:2]
     mask = mask & (points_2d[0, :] >= 0) & (points_2d[0, :] < image_w)
     mask = mask & (points_2d[1, :] >= 0) & (points_2d[1, :] < image_h)
@@ -225,52 +248,25 @@ def visualize_depth_map(camera_image, points_2d, depths, save_path=None):
 
 
 def main():
-    """Main function to project LiDAR onto camera"""
-
-    # Initialize NuScenes
+    # initialize NuScenes
     dataroot = 'data/nuscenes'
     version = 'v1.0-mini'
     nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
     
-    # Select a sample
+    # loading LiDAR and camera data
     sample_idx = 0
-    sample = nusc.sample[sample_idx]
+    lidar_points, camera_image, sample, lidar_token, camera_token = load_lidar_camera_sample(
+        nusc, sample_idx=sample_idx
+    )
     
-    print(f"\nProcessing Sample {sample_idx}")
-    print(f"Scene: {nusc.get('scene', sample['scene_token'])['name']}")
-    print(f"Timestamp: {sample['timestamp']}")
-    
-    # Get tokens
-    lidar_token = sample['data']['LIDAR_TOP']
-    camera_token = sample['data']['CAM_FRONT']
-    
-    # Load LiDAR data
-    lidar_sample = nusc.get('sample_data', lidar_token)
-    lidar_path = os.path.join(nusc.dataroot, lidar_sample['filename'])
-    lidar_pointcloud = LidarPointCloud.from_file(lidar_path)
-    lidar_points = lidar_pointcloud.points  # 4 x N
-    
-    print(f"\nLoaded LiDAR: {lidar_points.shape[1]} points")
-    
-    # Load camera image
-    camera_sample = nusc.get('sample_data', camera_token)
-    camera_path = os.path.join(nusc.dataroot, camera_sample['filename'])
-    camera_image = np.array(Image.open(camera_path))
-    
-    print(f"Loaded Camera: {camera_image.shape[1]}x{camera_image.shape[0]} pixels")
-    
-    # Get calibration matrices
-    print("\n" + "-"*70)
-    print("GET CALIBRATION MATRICES")
-    print("-"*70)
+    # getting calibration matrices
+    print("GET CALIBRATION MATRICES:")
     cam_intrinsic, lidar_to_cam_transform = get_calibration_matrices(
         nusc, lidar_token, camera_token
     )
     
-    # Project LiDAR to camera
-    print("\n" + "-"*70)
-    print("PROJECT 3D LIDAR POINTS TO 2D IMAGE")
-    print("-"*70)
+    # project LiDAR to camera
+    print("PROJECT 3D LIDAR POINTS TO 2D IMAGE:")
     points_2d, depths, mask = project_lidar_to_camera(
         lidar_points, 
         cam_intrinsic, 
@@ -283,7 +279,7 @@ def main():
         camera_image,
         points_2d,
         depths,
-        save_path='output_projection_overlay.png'
+        save_path='outputs/output_projection_overlay.png'
     )
     
     print("\nGenerating depth map visualization...")
@@ -291,11 +287,11 @@ def main():
         camera_image,
         points_2d,
         depths,
-        save_path='output_projection_depth.png'
+        save_path='outputs/output_projection_depth.png'
     )
     
     print("SUCCESS! LiDAR points projected onto camera image.")
-    # Return data for further use
+
     return {
         'nusc': nusc,
         'sample': sample,
